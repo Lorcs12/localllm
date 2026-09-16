@@ -73,6 +73,52 @@ class SpeculativeEngine:
     _device: str = "cpu"
 
     @classmethod
+    def from_streaming(
+        cls,
+        store_path: str,
+        draft_model_name: str = "gpt2",
+        config: OSDConfig | None = None,
+        device: str = "cpu",
+    ) -> SpeculativeEngine:
+        """Create engine with streaming target model + standard draft model.
+
+        The target model is streamed layer-by-layer from disk via WeightStore,
+        never loading the full model into RAM.
+        """
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from .streaming_model import StreamingGPT2, StreamingModelAdapter
+        from .weight_store import WeightStore
+
+        if config is None:
+            config = OSDConfig()
+
+        store = WeightStore(store_path)
+        streaming = StreamingGPT2(store)
+        target_model = StreamingModelAdapter(streaming)
+
+        draft_model = AutoModelForCausalLM.from_pretrained(draft_model_name).to(device)
+        draft_model.eval()
+        for p in draft_model.parameters():
+            p.requires_grad_(False)
+
+        tokenizer = AutoTokenizer.from_pretrained(draft_model_name)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        W_lm = get_lm_head_weights(draft_model)
+        draft_head = SMWDraftHead.from_lm_head(W_lm, config)
+
+        return cls(
+            draft_model=draft_model,
+            target_model=target_model,
+            draft_head=draft_head,
+            tokenizer=tokenizer,
+            config=config,
+            _device=device,
+        )
+
+    @classmethod
     def from_models(
         cls,
         draft_model_name: str,
@@ -219,7 +265,11 @@ class SpeculativeEngine:
             feat = features[0]  # [D], single sequence
             probs = self.draft_head.predict_probs(feat)
 
-            token_id = int(np.argmax(probs))
+            if self.config.do_sample and self.config.temperature > 0:
+                probs = probs / probs.sum()
+                token_id = int(np.random.choice(len(probs), p=probs))
+            else:
+                token_id = int(np.argmax(probs))
             draft_tokens.append(token_id)
             draft_features.append(feat)
             draft_probs.append(probs)

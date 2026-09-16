@@ -29,6 +29,11 @@ Five-phase pipeline per generation round:
 | `hardware.py` | L3 cache simulator, bandwidth models |
 | `sparse_ops.py` | Fused gather-GEMM reference (no-copy sparse matmul) |
 | `kv_cache.py` | INT4 quantization + H2O/StreamingLLM heavy-hitter eviction |
+| `hybrid_mamba.py` | Hybrid Mamba architecture simulation: Transformer vs Mamba at million-token scale |
+| `kv_router.py` | KV Router: hot/cold KV page management with async SSD fetch for infinite context |
+| `layer_stream.py` | Layer-streaming inference: static vs 1-buffer vs ping-pong 2-buffer strategies for RAM reduction |
+| `hybrid_engine.py` | Hybrid CPU+GPU inference: PowerInfer-style sparse/dense split with DirectStorage + AVX-512 |
+| `inference_engine.py` | Inference engine tier comparison: PyTorch vs GGML+ZigZag vs DirectStorage for 70B+ models on consumer hardware |
 | `pipeline.py` | Full 5-phase pipeline simulator with timing breakdown |
 
 ## Key Math (draft_head.py)

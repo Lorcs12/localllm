@@ -15,6 +15,7 @@ class OSDConfig:
     # --- Ridge head ---
     lam: float = 1.0
     temperature: float = 1.0
+    do_sample: bool = False
 
     # --- Adaptation ---
     window_size: int = 128

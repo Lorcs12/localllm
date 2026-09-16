@@ -36,6 +36,12 @@ class HardwareProfile:
     pcie_bandwidth_gb_s: float = 7.0
     num_cores: int = 12
 
+    gpu_vram_gb: float = 4.0
+    gpu_tflops: float = 2.984
+    gpu_bandwidth_gb_s: float = 128.0
+    gpu_decompression_gb_s: float = 24.0
+    ram_capacity_gb: float = 16.0
+
 
 @dataclass
 class L3Cache:
@@ -148,6 +154,23 @@ def compute_time_ms(
 ) -> float:
     """Time for pure arithmetic at peak throughput."""
     return (flops / (hw.cpu_tflops * 1e12)) * 1000
+
+
+def pcie_transfer_time_ms(
+    total_bytes: int,
+    hw: HardwareProfile,
+) -> float:
+    """Time to transfer data across the PCIe bus."""
+    gb = total_bytes / 1e9
+    return (gb / hw.pcie_bandwidth_gb_s) * 1000
+
+
+def gpu_compute_time_ms(
+    flops: int,
+    hw: HardwareProfile,
+) -> float:
+    """Time for pure GPU arithmetic at peak throughput."""
+    return (flops / (hw.gpu_tflops * 1e12)) * 1000
 
 
 def ssd_read_time_ms(

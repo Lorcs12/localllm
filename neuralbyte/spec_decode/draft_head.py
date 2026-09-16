@@ -93,7 +93,10 @@ class SMWDraftHead:
         squeeze = x.ndim == 1
         if squeeze:
             x = x[None, :]
-        logits = x @ self.W / self.config.temperature  # [batch, V]
+        if self.config.temperature == 0:
+            logits = x @ self.W
+        else:
+            logits = x @ self.W / self.config.temperature
         if squeeze:
             logits = logits[0]
         return logits

@@ -36,7 +36,24 @@ import numpy as np
 
 from .config import OSDConfig
 from .hardware import HardwareProfile, L3Cache, simulate_draft_window
+from .hybrid_mamba import (
+    HybridMambaConfig,
+    ModelSpec,
+    compare_architectures,
+    simulate_generation_loop,
+)
+from .hybrid_engine import HybridEngineConfig, simulate_hybrid_engine
+from .inference_engine import (
+    InferenceTier,
+    compare_tiers as compare_inference_tiers,
+)
 from .kv_cache import KVCache, KVCacheConfig, estimate_kv_cache_sizes
+from .layer_stream import (
+    LayerStreamConfig,
+    StreamMode,
+    estimate_memory as layer_stream_estimate_memory,
+    simulate_layer_stream,
+)
 from .metrics import AcceptanceTracker
 from .neuron_map import NeuronMap, NeuronMapConfig
 from .predictor import CUPConfig, CUPredictor, PredictionResult
@@ -54,6 +71,19 @@ class PipelineConfig:
     cup: CUPConfig = field(default_factory=CUPConfig)
     kv_cache: KVCacheConfig = field(default_factory=KVCacheConfig)
     sparse: SparseLayerConfig = field(default_factory=SparseLayerConfig)
+
+    # Layer streaming
+    layer_stream: LayerStreamConfig = field(default_factory=LayerStreamConfig)
+    layer_stream_mode: StreamMode = StreamMode.STREAM_1BUF
+
+    # Hybrid Mamba architecture (optional)
+    hybrid_mamba: HybridMambaConfig | None = None
+
+    # Inference engine tier (optional)
+    inference_tier: InferenceTier | None = None
+
+    # Hybrid engine (optional)
+    hybrid_engine: HybridEngineConfig | None = None
 
     # Pipeline parameters
     draft_tokens_per_round: int = 10
@@ -98,6 +128,10 @@ class PipelineSimResult:
     kv_stats: dict
     sparse_stats: dict
     cache_bypass_stats: dict
+    layer_stream_stats: dict
+    architecture_stats: dict | None = None
+    inference_engine_stats: dict | None = None
+    hybrid_engine_stats: dict | None = None
 
 
 def simulate_pipeline(config: PipelineConfig | None = None) -> PipelineSimResult:
@@ -145,7 +179,11 @@ def simulate_pipeline(config: PipelineConfig | None = None) -> PipelineSimResult
     )
     kv_read_ms = kv_result["optimized"]["latency_ms"]
 
-    verify_ms = sparse_verify_ms + kv_read_ms
+    # Phase 3 (continued): Layer streaming overhead for target model
+    ls_result = simulate_layer_stream(config.layer_stream, hw, config.layer_stream_mode)
+    layer_stream_verify_ms = ls_result.total_time_ms / max(1, config.total_tokens)
+
+    verify_ms = sparse_verify_ms + kv_read_ms + layer_stream_verify_ms
 
     # Phase 4: SMW update (~0.22ms per rejection)
     n_rejected = int(config.draft_tokens_per_round * (1 - config.acceptance_rate))
@@ -209,6 +247,37 @@ def simulate_pipeline(config: PipelineConfig | None = None) -> PipelineSimResult
     no_bypass = simulate_draft_window(hw, draft_tokens=config.draft_tokens_per_round, bypass_cache=False)
     with_bypass = draft_result
 
+    # Layer streaming comparison
+    ls_mem_static = layer_stream_estimate_memory(config.layer_stream, StreamMode.STATIC)
+    ls_mem_current = layer_stream_estimate_memory(config.layer_stream, config.layer_stream_mode)
+
+    # Architecture comparison (hybrid mamba vs standard transformer)
+    arch_stats = None
+    if config.hybrid_mamba is not None:
+        comparison = compare_architectures(
+            context_len=config.context_length,
+            hw=hw,
+            model_spec=config.hybrid_mamba.spec,
+        )
+        gen_loop = simulate_generation_loop(config.hybrid_mamba, hw)
+        arch_stats = {
+            "transformer_kv_gb": comparison.transformer["kv_cache_gb"],
+            "transformer_ttft_s": comparison.transformer["ttft_seconds"],
+            "transformer_fatal": comparison.transformer_fatal,
+            "hybrid_ram_mb": comparison.hybrid["total_ram_mb"],
+            "hybrid_ttft_ms": comparison.hybrid["ttft_ms"],
+            "memory_reduction_x": comparison.memory_reduction_x,
+            "ttft_reduction_x": comparison.ttft_reduction_x,
+            "gen_loop": gen_loop,
+        }
+
+    # Hybrid engine simulation (CPU sparse + GPU dense)
+    hybrid_engine_stats = (
+        simulate_hybrid_engine(config.hybrid_engine, hw)
+        if config.hybrid_engine is not None
+        else None
+    )
+
     return PipelineSimResult(
         total_tokens=tokens_generated,
         total_rounds=len(rounds),
@@ -228,6 +297,20 @@ def simulate_pipeline(config: PipelineConfig | None = None) -> PipelineSimResult
             "without_bypass_ok": no_bypass["pipeline_ok"],
             "with_bypass_ok": with_bypass["pipeline_ok"],
         },
+        layer_stream_stats={
+            "mode": config.layer_stream_mode.value,
+            "model_size_mb": config.layer_stream.total_model_mb,
+            "buffer_mb": ls_mem_current["buffer_mb"],
+            "static_mb": ls_mem_static["buffer_mb"],
+            "memory_reduction_x": ls_mem_current["reduction_x"],
+            "stream_time_ms": round(ls_result.total_time_ms, 2),
+            "overlap_saved_ms": round(ls_result.overlap_saved_ms, 2),
+        },
+        architecture_stats=arch_stats,
+        inference_engine_stats=(
+            compare_inference_tiers(hw=hw) if config.inference_tier is not None else None
+        ),
+        hybrid_engine_stats=hybrid_engine_stats,
     )
 
 
@@ -283,6 +366,64 @@ def print_pipeline_report(result: PipelineSimResult) -> str:
     sp = result.sparse_stats
     lines.append(f"  Fused gather-GEMM: {sp['total_ms']} ms across {sp['num_layers']} layers")
     lines.append("")
+
+    lines.append("Layer Streaming:")
+    ls = result.layer_stream_stats
+    lines.append(f"  Mode:             {ls['mode']}")
+    lines.append(f"  Model size:       {ls['model_size_mb']} MB (static)")
+    lines.append(f"  Buffer size:      {ls['buffer_mb']} MB ({ls['mode']})")
+    lines.append(f"  RAM reduction:    {ls['memory_reduction_x']}x")
+    lines.append(f"  Stream time:      {ls['stream_time_ms']} ms")
+    lines.append(f"  Overlap saved:    {ls['overlap_saved_ms']} ms")
+    lines.append("")
+
+    if result.architecture_stats is not None:
+        a = result.architecture_stats
+        lines.append("Architecture (Hybrid Mamba vs Transformer):")
+        if a["transformer_fatal"]:
+            lines.append(f"  Transformer:      {a['transformer_kv_gb']} GB KV cache (FATAL: OOM)")
+        else:
+            lines.append(f"  Transformer:      {a['transformer_kv_gb']} GB KV cache")
+        lines.append(f"  Transformer TTFT: {a['transformer_ttft_s']} s")
+        lines.append(f"  Hybrid Mamba:     {a['hybrid_ram_mb']} MB total RAM")
+        lines.append(f"  Hybrid TTFT:      {a['hybrid_ttft_ms']} ms")
+        lines.append(f"  Memory reduction: {a['memory_reduction_x']}x")
+        lines.append(f"  TTFT reduction:   {a['ttft_reduction_x']:.0f}x")
+        gl = a["gen_loop"]
+        if gl["fetch_hidden"]:
+            lines.append(f"  Generation:       Thread B hidden ({gl['thread_b_ms']}ms < {gl['thread_a_ms']}ms)")
+        else:
+            lines.append(f"  Generation:       Thread B overhead {gl['effective_overhead_ms']}ms")
+        lines.append("")
+
+    if result.inference_engine_stats is not None:
+        ie = result.inference_engine_stats
+        tiers = ie["tiers"]
+        lines.append("Inference Engine (PyTorch vs GGML+ZigZag vs DirectStorage):")
+        t1 = tiers["pytorch"]
+        t2 = tiers["ggml_zigzag"]
+        t3 = tiers["directstorage"]
+        t1_label = "FATAL" if not t1["feasible"] else f"{t1['tokens_per_second']:.4f} tok/s"
+        lines.append(f"  PyTorch:          {t1_label}")
+        lines.append(f"  GGML+ZigZag:      {t2['tokens_per_second']:.4f} tok/s ({t2['ram_needed_gb']} GB RAM)")
+        lines.append(f"  DirectStorage:    {t3['tokens_per_second']:.4f} tok/s ({t3['ram_needed_gb']:.2f} GB RAM)")
+        lines.append(f"  DS vs ZigZag:     {ie['speedup_ds_vs_zigzag']}x speedup")
+        lines.append(f"  Winner:           {ie['winner']}")
+        lines.append("")
+
+    if result.hybrid_engine_stats is not None:
+        he = result.hybrid_engine_stats
+        lines.append("Hybrid Engine (CPU Sparse + GPU Dense):")
+        if not he["feasible"]:
+            lines.append(f"  FATAL: {he['fatal_reason']}")
+        else:
+            lines.append(f"  GPU I/O:          {he['gpu_io_ms']:.2f} ms/layer (DirectStorage)")
+            lines.append(f"  CPU Sparse:       {he['cpu_sparse_ram_ms']:.4f} ms/layer (AVX-512)")
+            lines.append(f"  Forward Pass:     {he['forward_pass_ms']:.0f} ms")
+            lines.append(f"  Throughput:       {he['tokens_per_second']:.4f} tok/s")
+            lines.append(f"  Bottleneck:       {he['bottleneck']}")
+        lines.append("")
+
     lines.append("=" * 60)
 
     return "\n".join(lines)
